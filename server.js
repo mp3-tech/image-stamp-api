@@ -1,8 +1,14 @@
 const express = require('express');
 const multer = require('multer');
 const sharp = require('sharp');
+const path = require('path');
 
 const app = express();
+
+// Render 的 Linux 容器不含繁中字型。將 Noto Sans CJK TC 隨專案部署，
+// 並讓 Sharp/libvips 透過 fontconfig 找到它，避免中文被渲染成方框。
+const fontConfigFile = path.join(__dirname, 'fonts.conf');
+const fontFamily = 'Noto Sans CJK TC';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -84,7 +90,7 @@ app.post('/stamp', upload.single('image'), async (req, res) => {
           <text
             x="30"
             y="${Math.floor(lineSpacing * (index + 0.9))}"
-            font-family="Arial, 'Microsoft JhengHei', sans-serif"
+            font-family="${fontFamily}, sans-serif"
             font-size="${fontSize}"
             font-weight="bold"
             fill="white"
@@ -95,10 +101,14 @@ app.post('/stamp', upload.single('image'), async (req, res) => {
       </svg>
     `;
 
+    const textOverlay = await sharp(Buffer.from(svg), {
+      fontconfig: fontConfigFile,
+    }).png().toBuffer();
+
     const processedImage = await image
       .composite([
         {
-          input: Buffer.from(svg),
+          input: textOverlay,
           gravity: 'south',
         },
       ])
