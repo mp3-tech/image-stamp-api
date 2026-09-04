@@ -48,8 +48,12 @@ app.post('/stamp', upload.single('image'), async (req, res) => {
       caseNumber = '',
     } = req.body;
 
-    // 將包含 \n 的地址與經緯度拆分成獨立多行
-    const locRawLines = String(stampLocation || '').split('\n').map(l => l.trim()).filter(Boolean);
+    // 將包含 \n 的地址與經緯度拆分成獨立多行。Google Maps 的長網址
+    // 不適合寫入圖片，也可能超出 Pango 文字圖層的寬度而讓合成失敗。
+    const locRawLines = String(stampLocation || '')
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line && !/(?:google\s*maps|https?:\/\/)/i.test(line));
     const formattedLocLines = locRawLines.map(line => {
       if (line.startsWith('📍') || line.startsWith('🧭') || line.startsWith('🗺️')) {
         return line;
@@ -75,6 +79,16 @@ app.post('/stamp', upload.single('image'), async (req, res) => {
     const fontSize = Math.max(14, Math.min(30, Math.floor(overlayHeight / (lineCount + 1.2))));
     const lineSpacing = Math.max(22, Math.floor(overlayHeight / (lineCount + 0.5)));
 
+    // 即使上游送來未被辨識的長字串，也絕不讓單一文字圖層超出底圖。
+    // 中文一字最寬約等於 fontSize，保留邊界後計算安全字數。
+    const maxCharsPerLine = Math.max(16, Math.floor((width - 70) / fontSize));
+    const renderLines = lines.map(line => {
+      const chars = Array.from(String(line));
+      return chars.length > maxCharsPerLine
+        ? `${chars.slice(0, maxCharsPerLine - 1).join('')}…`
+        : line;
+    });
+
     // 不使用 SVG 文字：其字型解析在 Render 上可能忽略專案的 fontconfig。
     // Sharp 的原生 text 輸入可直接指定字型檔絕對路徑，確保繁中一定使用內附字型。
     const textOverlay = await sharp({
@@ -85,7 +99,7 @@ app.post('/stamp', upload.single('image'), async (req, res) => {
         background: { r: 0, g: 0, b: 0, alpha: 0.78 },
       },
     })
-      .composite(lines.map((text, index) => ({
+      .composite(renderLines.map((text, index) => ({
         input: {
           text: {
             text: `<span foreground="white" font_weight="bold">${escapeXml(text)}</span>`,
