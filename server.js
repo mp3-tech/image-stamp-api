@@ -42,7 +42,7 @@ app.post('/stamp', upload.single('image'), async (req, res) => {
     }
 
     const {
-      stampType = '📸 救傷現場紀錄',
+      stampType = '救傷現場紀錄',
       stampTime = '',
       stampLocation = '',
       caseNumber = '',
@@ -55,18 +55,22 @@ app.post('/stamp', upload.single('image'), async (req, res) => {
       .map(line => line.trim())
       .filter(line => line && !/(?:google\s*maps|https?:\/\/)/i.test(line));
     const formattedLocLines = locRawLines.map(line => {
-      if (line.startsWith('📍') || line.startsWith('🧭') || line.startsWith('🗺️')) {
-        return line;
-      }
-      return `📍 ${line}`;
+      return line
+        .replace(/^[📍🧭🗺️]\s*/u, '')
+        .replace(/^GPS\s*經緯度[：:]/, 'GPS：');
     });
+
+    const stripEmoji = value => String(value || '')
+      .replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
 
     const lines = [
       stampType,
-      stampTime ? `🕒 拍攝時間：${stampTime.replace(/^🕒\s*/, '')}` : '',
+      stampTime ? `拍攝時間：${stampTime.replace(/^🕒\s*/, '')}` : '',
       ...formattedLocLines,
-      caseNumber ? `📋 案件編號：${caseNumber.replace(/^📋\s*/, '')}` : '',
-    ].filter(Boolean);
+      caseNumber ? `案件編號：${caseNumber.replace(/^📋\s*/, '')}` : '',
+    ].map(stripEmoji).filter(Boolean);
 
     const image = sharp(req.file.buffer);
     const metadata = await image.metadata();
