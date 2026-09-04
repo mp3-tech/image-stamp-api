@@ -7,8 +7,8 @@ const app = express();
 
 // Render 的 Linux 容器不含繁中字型。將 Noto Sans CJK TC 隨專案部署，
 // 並讓 Sharp/libvips 透過 fontconfig 找到它，避免中文被渲染成方框。
-const fontConfigFile = path.join(__dirname, 'fonts.conf');
 const fontFamily = 'Noto Sans CJK TC';
+const fontFile = path.join(__dirname, 'fonts', 'NotoSansCJKtc-Regular.otf');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -75,35 +75,32 @@ app.post('/stamp', upload.single('image'), async (req, res) => {
     const fontSize = Math.max(14, Math.min(30, Math.floor(overlayHeight / (lineCount + 1.2))));
     const lineSpacing = Math.max(22, Math.floor(overlayHeight / (lineCount + 0.5)));
 
-    const svg = `
-      <svg
-        width="${width}"
-        height="${overlayHeight}"
-        xmlns="http://www.w3.org/2000/svg"
-      >
-        <rect
-          width="100%"
-          height="100%"
-          fill="rgba(0,0,0,0.78)"
-        />
-        ${lines.map((text, index) => `
-          <text
-            x="30"
-            y="${Math.floor(lineSpacing * (index + 0.9))}"
-            font-family="${fontFamily}, sans-serif"
-            font-size="${fontSize}"
-            font-weight="bold"
-            fill="white"
-          >
-            ${escapeXml(text)}
-          </text>
-        `).join('')}
-      </svg>
-    `;
-
-    const textOverlay = await sharp(Buffer.from(svg), {
-      fontconfig: fontConfigFile,
-    }).png().toBuffer();
+    // 不使用 SVG 文字：其字型解析在 Render 上可能忽略專案的 fontconfig。
+    // Sharp 的原生 text 輸入可直接指定字型檔絕對路徑，確保繁中一定使用內附字型。
+    const textOverlay = await sharp({
+      create: {
+        width,
+        height: overlayHeight,
+        channels: 4,
+        background: { r: 0, g: 0, b: 0, alpha: 0.78 },
+      },
+    })
+      .composite(lines.map((text, index) => ({
+        input: {
+          text: {
+            text: `<span foreground="white" font_weight="bold">${escapeXml(text)}</span>`,
+            font: `${fontFamily} ${fontSize}px`,
+            fontfile: fontFile,
+            width: width - 60,
+            height: lineSpacing,
+            rgba: true,
+          },
+        },
+        left: 30,
+        top: Math.floor(lineSpacing * (index + 0.1)),
+      })))
+      .png()
+      .toBuffer();
 
     const processedImage = await image
       .composite([
