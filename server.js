@@ -132,7 +132,11 @@ app.post('/stamp', upload.single('image'), async (req, res) => {
       })
       .toBuffer();
 
-    res.type('image/jpeg').send(processedImage);
+    // n8n 會將這個檔名帶往圖床；保留 .jpg 副檔名可讓 LINE 正確辨識返圖 MIME 類型。
+    res
+      .type('image/jpeg')
+      .set('Content-Disposition', 'inline; filename="time-camera.jpg"')
+      .send(processedImage);
   } catch (error) {
     console.error('圖片處理失敗:', error);
     res.status(500).json({
