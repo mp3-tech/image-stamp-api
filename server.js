@@ -122,6 +122,11 @@ async function resolveGoogleMapsPlace(address) {
       : { matched: false, source: 'google_maps_place' };
   } catch (error) {
     // 地址找不到、Google 要求驗證或暫時不可用都視為「無法精確判定」，讓上游保持空值。
+    // 只記錄去識別化的技術訊息，地址（含在網址中的查詢字串）不寫進 Render 日誌。
+    const safeDetail = String(error?.message || error || 'unknown error')
+      .replace(/https?:\/\/\S+/gi, '[url]')
+      .slice(0, 300);
+    console.warn(`Google Maps coordinate resolver failed: ${safeDetail}`);
     return { matched: false, source: 'google_maps_place' };
   } finally {
     if (page) await page.close().catch(() => undefined);
