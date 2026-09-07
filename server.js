@@ -1,5 +1,6 @@
 const express = require('express');
 const multer = require('multer');
+const puppeteer = require('puppeteer');
 const sharp = require('sharp');
 const path = require('path');
 
@@ -13,6 +14,120 @@ const fontFile = path.join(__dirname, 'fonts', 'NotoSansCJKtc-Regular.otf');
 const upload = multer({
   storage: multer.memoryStorage(),
 });
+
+// Google Maps 並沒有提供免金鑰、可直接呼叫的地址轉座標 API。這個端點只開啟
+// Google Maps 的公開地圖頁，等待它完成定位後，讀取該地點的 !3d/!4d 標記。
+// 不使用 @緯度,經度，因為那是地圖目前畫面的中心，不一定是地址的實際位置。
+const GOOGLE_MAPS_TIMEOUT_MS = 20000;
+const GOOGLE_MAPS_MIN_INTERVAL_MS = 1100;
+const GOOGLE_MAPS_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const GOOGLE_MAPS_NEGATIVE_CACHE_TTL_MS = 60 * 60 * 1000;
+const GOOGLE_MAPS_MAX_PENDING = 8;
+const GOOGLE_MAPS_MAX_CACHE_ENTRIES = 500;
+
+const googleMapsCache = new Map();
+let googleMapsQueue = Promise.resolve();
+let googleMapsNextStartAt = 0;
+let googleMapsPending = 0;
+
+const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+function normalizeAddress(address) {
+  return String(address || '')
+    .normalize('NFKC')
+    .replace(/\s+/g, '')
+    .replace(/[臺台]/g, '台')
+    .trim();
+}
+
+function validCoordinates(latitude, longitude) {
+  return Number.isFinite(latitude)
+    && Number.isFinite(longitude)
+    && latitude >= -90
+    && latitude <= 90
+    && longitude >= -180
+    && longitude <= 180;
+}
+
+function parseGoogleMapsPlaceCoordinates(url) {
+  // !3d/!4d 是 Google Maps 選定地點的座標；優先於網址中的 @ 地圖視窗中心。
+  const match = String(url || '').match(
+    /!3d(-?\d{1,2}(?:\.\d+)?)!4d(-?\d{1,3}(?:\.\d+)?)/,
+  );
+  if (!match) return null;
+
+  const latitude = Number(match[1]);
+  const longitude = Number(match[2]);
+  return validCoordinates(latitude, longitude) ? { latitude, longitude } : null;
+}
+
+function getCachedGoogleMapsResult(cacheKey) {
+  const cached = googleMapsCache.get(cacheKey);
+  if (!cached) return undefined;
+  if (cached.expiresAt <= Date.now()) {
+    googleMapsCache.delete(cacheKey);
+    return undefined;
+  }
+  return cached.value;
+}
+
+function cacheGoogleMapsResult(cacheKey, value, ttlMs) {
+  if (googleMapsCache.size >= GOOGLE_MAPS_MAX_CACHE_ENTRIES) {
+    const oldestKey = googleMapsCache.keys().next().value;
+    if (oldestKey) googleMapsCache.delete(oldestKey);
+  }
+  googleMapsCache.set(cacheKey, { value, expiresAt: Date.now() + ttlMs });
+}
+
+function enqueueGoogleMapsLookup(work) {
+  const task = googleMapsQueue.then(work, work);
+  // 失敗不能讓後續案件永遠卡在 rejected 的 queue 上。
+  googleMapsQueue = task.catch(() => undefined);
+  return task;
+}
+
+async function resolveGoogleMapsPlace(address) {
+  const waitMs = Math.max(0, googleMapsNextStartAt - Date.now());
+  if (waitMs) await sleep(waitMs);
+  googleMapsNextStartAt = Date.now() + GOOGLE_MAPS_MIN_INTERVAL_MS;
+
+  let browser;
+  let page;
+  try {
+    browser = await puppeteer.launch({
+      headless: 'shell',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+      ],
+    });
+    page = await browser.newPage();
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'zh-TW,zh;q=0.9',
+    });
+    page.setDefaultNavigationTimeout(GOOGLE_MAPS_TIMEOUT_MS);
+    page.setDefaultTimeout(GOOGLE_MAPS_TIMEOUT_MS);
+
+    const mapsUrl = `https://www.google.com/maps/place/${encodeURIComponent(address)}`;
+    await page.goto(mapsUrl, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(
+      () => /!3d-?\d{1,2}(?:\.\d+)?!4d-?\d{1,3}(?:\.\d+)?/.test(window.location.href),
+      { timeout: GOOGLE_MAPS_TIMEOUT_MS },
+    );
+
+    const coordinates = parseGoogleMapsPlaceCoordinates(page.url());
+    return coordinates
+      ? { matched: true, source: 'google_maps_place', ...coordinates }
+      : { matched: false, source: 'google_maps_place' };
+  } catch (error) {
+    // 地址找不到、Google 要求驗證或暫時不可用都視為「無法精確判定」，讓上游保持空值。
+    return { matched: false, source: 'google_maps_place' };
+  } finally {
+    if (page) await page.close().catch(() => undefined);
+    if (browser) await browser.close().catch(() => undefined);
+  }
+}
 
 function escapeXml(unsafe) {
   return String(unsafe || '')
@@ -28,8 +143,50 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'Taoyuan Wildlife Rescue Image Stamp API',
+    features: ['image-stamp', 'google-maps-address-coordinates'],
     timestamp: new Date().toISOString()
   });
+});
+
+// 1a. 地址轉經緯度：只在 Google Maps 出現選定地點的 !3d/!4d 座標時才成功。
+// 若查無結果、Google 暫時無回應或不確定，固定回傳 matched:false；上游不可填入替代值。
+app.get('/geocode/google-maps', async (req, res) => {
+  const address = String(req.query.address || '').trim();
+  const cacheKey = normalizeAddress(address);
+
+  if (!cacheKey || address.length > 200) {
+    return res.status(400).json({
+      matched: false,
+      source: 'google_maps_place',
+      error: '請提供 1 至 200 個字的地址',
+    });
+  }
+
+  const cached = getCachedGoogleMapsResult(cacheKey);
+  if (cached !== undefined) {
+    return res.json({ ...cached, cached: true });
+  }
+
+  if (googleMapsPending >= GOOGLE_MAPS_MAX_PENDING) {
+    return res.status(429).json({
+      matched: false,
+      source: 'google_maps_place',
+      error: '地址查詢忙碌中，請稍後再試',
+    });
+  }
+
+  googleMapsPending += 1;
+  try {
+    const result = await enqueueGoogleMapsLookup(() => resolveGoogleMapsPlace(address));
+    cacheGoogleMapsResult(
+      cacheKey,
+      result,
+      result.matched ? GOOGLE_MAPS_CACHE_TTL_MS : GOOGLE_MAPS_NEGATIVE_CACHE_TTL_MS,
+    );
+    return res.json({ ...result, cached: false });
+  } finally {
+    googleMapsPending -= 1;
+  }
 });
 
 // 2. 數位時間相機圖片防偽鋼印端點
