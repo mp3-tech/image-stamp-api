@@ -4,6 +4,7 @@
   "description": "Taoyuan Wildlife Rescue Image Stamp API",
   "main": "server.js",
   "scripts": {
+    "postinstall": "puppeteer browsers install chrome-headless-shell",
     "start": "node server.js"
   },
   "dependencies": {
