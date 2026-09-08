@@ -10,6 +10,10 @@ const app = express();
 // 並讓 Sharp/libvips 透過 fontconfig 找到它，避免中文被渲染成方框。
 const fontFamily = 'Noto Sans CJK TC';
 const fontFile = path.join(__dirname, 'fonts', 'NotoSansCJKtc-Regular.otf');
+// LINE 原圖常達數千萬像素；鋼印不需要保留原始解析度。限制最長邊可
+// 大幅降低免費 Render 的記憶體與處理時間，也能讓後續圖床與 LINE 更快取用。
+const STAMP_IMAGE_MAX_DIMENSION = 1920;
+const STAMP_JPEG_QUALITY = 85;
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -234,10 +238,19 @@ app.post('/stamp', upload.single('image'), async (req, res) => {
       caseNumber ? `案件編號：${caseNumber.replace(/^📋\s*/, '')}` : '',
     ].map(stripEmoji).filter(Boolean);
 
-    const image = sharp(req.file.buffer);
-    const metadata = await image.metadata();
-    const width = metadata.width || 1200;
-    const height = metadata.height || 800;
+    const metadata = await sharp(req.file.buffer).metadata();
+    const sourceWidth = metadata.width || 1200;
+    const sourceHeight = metadata.height || 800;
+    // EXIF 5–8 代表圖片顯示時會旋轉 90 度；先以實際顯示方向計算疊圖尺寸。
+    const isSidewaysOrientation = [5, 6, 7, 8].includes(metadata.orientation);
+    const orientedWidth = isSidewaysOrientation ? sourceHeight : sourceWidth;
+    const orientedHeight = isSidewaysOrientation ? sourceWidth : sourceHeight;
+    const scale = Math.min(1, STAMP_IMAGE_MAX_DIMENSION / Math.max(orientedWidth, orientedHeight));
+    const width = Math.max(1, Math.round(orientedWidth * scale));
+    const height = Math.max(1, Math.round(orientedHeight * scale));
+    const image = sharp(req.file.buffer)
+      .rotate()
+      .resize(width, height, { fit: 'fill' });
 
     // 動態根據行數計算 SVG 疊加層高度與字體大小，確保多行換行 100% 完美呈現
     const lineCount = lines.length;
@@ -290,7 +303,8 @@ app.post('/stamp', upload.single('image'), async (req, res) => {
         },
       ])
       .jpeg({
-        quality: 92,
+        quality: STAMP_JPEG_QUALITY,
+        mozjpeg: true,
       })
       .toBuffer();
 
