@@ -3,6 +3,7 @@ const multer = require('multer');
 const puppeteer = require('puppeteer');
 const sharp = require('sharp');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -18,6 +19,38 @@ const STAMP_JPEG_QUALITY = 85;
 const upload = multer({
   storage: multer.memoryStorage(),
 });
+
+// LINE 的 image message 必須使用可公開讀取的 HTTPS 網址。先前使用的
+// 第三方圖床從 n8n 主機連線時會長時間無回應，因此改由本服務短暫保存已加蓋
+// 的圖片，讓 LINE 在收到推播後立即取用。網址是不可猜的 UUID，且最多保留
+// 15 分鐘，不會形成永久公開的照片檔案庫。
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL
+  || 'https://taoyuan-wildlife-image-stamp.onrender.com';
+const TEMP_LINE_IMAGE_TTL_MS = 15 * 60 * 1000;
+const TEMP_LINE_IMAGE_MAX_ENTRIES = 50;
+const temporaryLineImages = new Map();
+
+function removeExpiredTemporaryImages(now = Date.now()) {
+  for (const [id, image] of temporaryLineImages) {
+    if (image.expiresAt <= now) temporaryLineImages.delete(id);
+  }
+  while (temporaryLineImages.size > TEMP_LINE_IMAGE_MAX_ENTRIES) {
+    const oldestId = temporaryLineImages.keys().next().value;
+    if (!oldestId) break;
+    temporaryLineImages.delete(oldestId);
+  }
+}
+
+function saveTemporaryLineImage(buffer, mimeType) {
+  removeExpiredTemporaryImages();
+  const id = crypto.randomUUID();
+  temporaryLineImages.set(id, {
+    buffer,
+    mimeType: mimeType || 'image/jpeg',
+    expiresAt: Date.now() + TEMP_LINE_IMAGE_TTL_MS,
+  });
+  return `${PUBLIC_BASE_URL}/line-image/${id}`;
+}
 
 // Google Maps 並沒有提供免金鑰、可直接呼叫的地址轉座標 API。這個端點只開啟
 // Google Maps 的公開地圖頁，等待它完成定位後，讀取該地點的 !3d/!4d 標記。
@@ -196,6 +229,30 @@ app.get('/geocode/google-maps', async (req, res) => {
   } finally {
     googleMapsPending -= 1;
   }
+});
+
+// 將 n8n 已加蓋完成的圖片暫存為短效 HTTPS 網址。回傳純文字網址以相容
+// 原本 Catbox 節點的輸出格式，後續合併與 LINE 推播節點不必改動資料欄位。
+app.post('/line-image', upload.single('fileToUpload'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: '找不到 fileToUpload 圖片檔案' });
+  }
+
+  const imageUrl = saveTemporaryLineImage(req.file.buffer, req.file.mimetype);
+  return res.type('text/plain').send(imageUrl);
+});
+
+app.get('/line-image/:id', (req, res) => {
+  removeExpiredTemporaryImages();
+  const image = temporaryLineImages.get(req.params.id);
+  if (!image) {
+    return res.status(404).json({ error: '圖片網址已過期，請重新上傳' });
+  }
+
+  return res
+    .type(image.mimeType)
+    .set('Cache-Control', 'public, max-age=600, immutable')
+    .send(image.buffer);
 });
 
 // 2. 數位時間相機圖片防偽鋼印端點
